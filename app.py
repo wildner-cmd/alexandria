@@ -1,12 +1,12 @@
 import time
+import urllib.parse
 import pandas as pd
 import streamlit as st
 import requests
 
 st.set_page_config(page_title="Alexandria — Prospecção Grupo A (ANEEL)", layout="wide")
-
 st.title("Alexandria — Prospecção Grupo A (ANEEL)")
-st.caption("Versão sem SQL (datastore_search). Filtra/ordena no Python e gera TOP 500.")
+st.caption("Versão comercial (sem Places): TOP maior, colunas ricas, export CRM e links de prospecção (Google Search + WhatsApp).")
 
 CKAN_SEARCH_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
 
@@ -20,12 +20,12 @@ UF_BY_IBGE_UF_CODE = {
     41:"PR",42:"SC",43:"RS",
     50:"MS",51:"MT",52:"GO",53:"DF"
 }
+UF_CODE_REV = {v:k for k,v in UF_BY_IBGE_UF_CODE.items()}
 
+# ---------------- CKAN (sem SQL) ----------------
 def ckan_search(resource_id: str, limit: int, offset: int) -> pd.DataFrame:
-    """datastore_search (sem SQL)."""
     last = None
     headers = {"User-Agent": "AlexandriaStreamlit/1.0"}
-
     for i in range(4):
         try:
             r = requests.get(
@@ -34,73 +34,26 @@ def ckan_search(resource_id: str, limit: int, offset: int) -> pd.DataFrame:
                 timeout=90,
                 headers=headers
             )
-
             if r.status_code in (429, 500, 502, 503, 504):
                 last = (r.status_code, (r.text or "")[:250])
                 time.sleep(2 * (i+1))
                 continue
-
             if r.status_code != 200:
                 last = (r.status_code, (r.text or "")[:250])
                 time.sleep(2 * (i+1))
                 continue
-
             data = r.json()
             if not data.get("success"):
                 last = ("success=false", str(data)[:250])
                 time.sleep(2 * (i+1))
                 continue
-
             return pd.DataFrame(data["result"]["records"])
-
         except Exception as e:
             last = ("EXC", str(e)[:250])
             time.sleep(2 * (i+1))
 
     st.error(f"Falha ao consultar ANEEL/CKAN. Detalhe: {last}")
     return pd.DataFrame()
-
-def to_num(x):
-    """Converte texto de demanda para float (remove lixo)."""
-    if x is None:
-        return None
-    s = str(x)
-    s = s.replace(",", ".")
-    # mantém só dígitos e ponto
-    cleaned = "".join(ch for ch in s if (ch.isdigit() or ch == "."))
-    try:
-        return float(cleaned) if cleaned else None
-    except:
-        return None
-
-def enrich(df: pd.DataFrame, demand_col: str, lat_col: str, lon_col: str, mun_col: str | None) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    # padroniza
-    df["Demanda_kW"] = df[demand_col].apply(to_num) if demand_col in df.columns else None
-    df["Latitude"] = pd.to_numeric(df[lat_col], errors="coerce") if lat_col in df.columns else None
-    df["Longitude"] = pd.to_numeric(df[lon_col], errors="coerce") if lon_col in df.columns else None
-
-    df = df.dropna(subset=["Demanda_kW", "Latitude", "Longitude"])
-
-    if mun_col and mun_col in df.columns:
-        df[mun_col] = pd.to_numeric(df[mun_col], errors="coerce")
-        uf_code = (df[mun_col].fillna(0).astype(int) // 100000).astype(int)
-        df["UF"] = uf_code.map(UF_BY_IBGE_UF_CODE).fillna("??")
-    else:
-        df["UF"] = "??"
-
-    def potencial(x):
-        if x >= 5000: return "AAA"
-        if x >= 2000: return "AA"
-        if x >= 500:  return "A"
-        if x >= 100:  return "B"
-        return "C"
-    df["Potencial"] = df["Demanda_kW"].apply(potencial)
-
-    df["GoogleMaps"] = df.apply(lambda r: f"https://www.google.com/maps?q={r['Latitude']},{r['Longitude']}", axis=1)
-    return df
 
 @st.cache_data(ttl=3600)
 def probe_columns(resource_id: str) -> list[str]:
@@ -114,57 +67,133 @@ def pick(cols: list[str], candidates: list[str]) -> str | None:
             return low[cand.lower()]
     return None
 
-def fetch_top(resource_id: str, demand_col: str, lat_col: str, lon_col: str, mun_col: str | None,
-              min_kw: float, top_n: int, chunk: int = 5000, max_chunks: int = 12) -> pd.DataFrame:
-    """
-    Busca em blocos no datastore_search, filtra/ordena no Python e devolve Top N.
-    max_chunks controla quanto do dataset você varre (evita travar).
-    """
-    all_parts = []
-    offset = 0
+def to_num(x):
+    if x is None:
+        return None
+    s = str(x).replace(",", ".")
+    cleaned = "".join(ch for ch in s if (ch.isdigit() or ch == "."))
+    try:
+        return float(cleaned) if cleaned else None
+    except:
+        return None
 
+def make_google_search_link(query: str) -> str:
+    return "https://www.google.com/search?q=" + urllib.parse.quote(query)
+
+def make_whatsapp_link(msg: str) -> str:
+    return "https://wa.me/?text=" + urllib.parse.quote(msg)
+
+def enrich_base(df: pd.DataFrame, demand_col: str, lat_col: str, lon_col: str, mun_col: str | None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df["Demanda_kW"] = df[demand_col].apply(to_num) if demand_col in df.columns else None
+    df["Latitude"] = pd.to_numeric(df[lat_col], errors="coerce") if lat_col in df.columns else None
+    df["Longitude"] = pd.to_numeric(df[lon_col], errors="coerce") if lon_col in df.columns else None
+    df = df.dropna(subset=["Demanda_kW", "Latitude", "Longitude"])
+
+    # UF
+    if mun_col and mun_col in df.columns:
+        mun_num = pd.to_numeric(df[mun_col], errors="coerce")
+        uf_code = (mun_num.fillna(0).astype("int64") // 100000).astype("int64")
+        df["UF"] = uf_code.map(UF_BY_IBGE_UF_CODE).fillna("??")
+    else:
+        df["UF"] = "??"
+
+    # Potencial
+    def potencial(x):
+        if x >= 5000: return "AAA"
+        if x >= 2000: return "AA"
+        if x >= 500:  return "A"
+        if x >= 100:  return "B"
+        return "C"
+    df["Potencial"] = df["Demanda_kW"].apply(potencial)
+
+    # Detecta colunas de endereço (se existirem)
+    LGRD = next((c for c in df.columns if c.upper() in ("LGRD","LOGRADOURO","ENDERECO")), None)
+    BRR  = next((c for c in df.columns if c.upper() in ("BRR","BAIRRO")), None)
+    CEP  = next((c for c in df.columns if c.upper() == "CEP"), None)
+
+    # CNAE, DIST, ID
+    CNAE = next((c for c in df.columns if c.upper() == "CNAE"), None)
+    DIST = next((c for c in df.columns if c.upper() in ("DIST","DISTRIBUIDORA","SIGLA_DIST")), None)
+    IDUC = next((c for c in df.columns if c.upper() in ("COD_ID_ENCR","COD_ID_ENC","COD_ID_ENCRYP")), None)
+
+    def addr_text(r):
+        parts = []
+        if LGRD and pd.notna(r.get(LGRD)): parts.append(str(r.get(LGRD)).strip())
+        if BRR and pd.notna(r.get(BRR)): parts.append(str(r.get(BRR)).strip())
+        if CEP and pd.notna(r.get(CEP)): parts.append(f"CEP {str(r.get(CEP)).strip()}")
+        parts.append(r.get("UF",""))
+        return ", ".join([p for p in parts if p])
+
+    df["Endereco"] = df.apply(addr_text, axis=1)
+    df["GoogleMaps"] = df.apply(lambda r: f"https://www.google.com/maps?q={r['Latitude']},{r['Longitude']}", axis=1)
+
+    # Links de prospecção (Google Search)
+    df["BuscaGoogle"] = df.apply(lambda r: make_google_search_link(r["Endereco"] if r["Endereco"] else f"{r['Latitude']},{r['Longitude']}"), axis=1)
+
+    # WhatsApp com texto (sem número — você cola o número que achar)
+    msg_base = ("Olá! Tudo bem? Aqui é o Fernando, da Alexandria Energia. "
+                "Estou falando com o responsável pela área administrativa/energia? "
+                "Estou fazendo um diagnóstico rápido para reduzir custos com energia em grandes consumidores.")
+    df["WhatsAppTexto"] = df.apply(lambda r: make_whatsapp_link(msg_base + f" (Ref: {r.get('UF','')})"), axis=1)
+
+    if CNAE:
+        df["CNAE_Limpo"] = df[CNAE].astype(str).str.replace(r"[^0-9]", "", regex=True)
+    if DIST:
+        df["Distribuidora"] = df[DIST]
+    if IDUC:
+        df["ID_UC"] = df[IDUC]
+
+    return df
+
+def fetch_top(resource_id: str, demand_col: str, lat_col: str, lon_col: str, mun_col: str | None,
+              min_kw: float, top_n: int, chunk: int, max_chunks: int) -> pd.DataFrame:
+    parts = []
+    offset = 0
     for _ in range(max_chunks):
         df0 = ckan_search(resource_id, limit=chunk, offset=offset)
         if df0.empty:
             break
-
-        df1 = enrich(df0, demand_col, lat_col, lon_col, mun_col)
+        df1 = enrich_base(df0, demand_col, lat_col, lon_col, mun_col)
         df1 = df1[df1["Demanda_kW"] >= float(min_kw)]
-
-        all_parts.append(df1)
+        if not df1.empty:
+            parts.append(df1)
         offset += chunk
 
-        # atalho: se já temos bastante, podemos parar cedo
-        if sum(len(x) for x in all_parts) >= top_n * 8:
+        # para cedo se já tem bastante sobra
+        if sum(len(x) for x in parts) >= top_n * 10:
             break
 
-    if not all_parts:
+    if not parts:
         return pd.DataFrame()
 
-    df = pd.concat(all_parts, ignore_index=True)
+    df = pd.concat(parts, ignore_index=True)
     df = df.sort_values("Demanda_kW", ascending=False).head(int(top_n))
     return df
 
-# ============ UI ============
+# ================= UI =================
 st.sidebar.header("Parâmetros")
 
 fonte = st.sidebar.selectbox("Fonte", ["UCMT (Média tensão PJ)", "UCAT (Alta tensão PJ)"])
 resource_id = RESOURCE_UCMT if fonte.startswith("UCMT") else RESOURCE_UCAT
 
 min_kw = st.sidebar.number_input("Demanda mínima (kW)", min_value=0.0, value=1000.0, step=100.0)
+
 ufs = ["(todas)"] + list(UF_BY_IBGE_UF_CODE.values())
-uf_sel = st.sidebar.selectbox("Filtro UF (opcional)", ufs, index=0)
+uf_sel = st.sidebar.selectbox("Filtro UF (opcional)", ufs, index=ufs.index("PR") if "PR" in ufs else 0)
 uf_filter = None if uf_sel == "(todas)" else uf_sel
 
 cols = probe_columns(resource_id)
 if not cols:
-    st.error("Não consegui ler colunas do dataset (datastore_search). Tente 'Manage app → Reboot'.")
+    st.error("Não consegui ler colunas do dataset. Tente 'Manage app → Reboot'.")
     st.stop()
 
-DEMAND_CANDS = ["dem_cont", "DEM_CONT", "demanda", "dem_kw", "dem"]
-LAT_CANDS    = ["point_y", "POINT_Y", "lat", "latitude", "y"]
-LON_CANDS    = ["point_x", "POINT_X", "lon", "longitude", "x"]
-MUN_CANDS    = ["mun", "MUN", "cod_mun", "ibge_mun", "municipio", "cd_mun"]
+DEMAND_CANDS = ["dem_cont","DEM_CONT","demanda","dem_kw","dem"]
+LAT_CANDS    = ["point_y","POINT_Y","lat","latitude","y"]
+LON_CANDS    = ["point_x","POINT_X","lon","longitude","x"]
+MUN_CANDS    = ["mun","MUN","cod_mun","ibge_mun","municipio","cd_mun"]
 
 auto_demand = pick(cols, DEMAND_CANDS) or cols[0]
 auto_lat    = pick(cols, LAT_CANDS) or cols[0]
@@ -180,40 +209,78 @@ mun_col    = st.sidebar.selectbox("Coluna de Município (opcional)", ["(nenhuma)
 mun_col = None if mun_col == "(nenhuma)" else mun_col
 
 st.sidebar.subheader("TOP (atalhos)")
-top_n = st.sidebar.selectbox("Tamanho do TOP", [100, 200, 500, 1000], index=2)
-btn_top = st.sidebar.button("Gerar TOP agora", type="primary")
+top_opt = st.sidebar.selectbox(
+    "Tamanho do TOP",
+    ["100","200","500","1000","2000","5000","10000","MAX (seguro)"],
+    index=2
+)
 
-# Execução
-if btn_top:
-    with st.spinner("Buscando blocos e calculando TOP..."):
-        df = fetch_top(resource_id, demand_col, lat_col, lon_col, mun_col, min_kw=min_kw, top_n=int(top_n))
+chunk = st.sidebar.selectbox("Tamanho do bloco (chunk)", [2000, 5000, 10000], index=1)
+max_chunks = st.sidebar.selectbox("Máx. blocos varridos", [4, 8, 12, 20], index=2)
+
+btn_run = st.sidebar.button("Gerar TOP agora", type="primary")
+
+if btn_run:
+    if top_opt.startswith("MAX"):
+        top_n = int(chunk) * int(max_chunks)
+    else:
+        top_n = int(top_opt)
+
+    with st.spinner("Buscando dados e montando TOP..."):
+        df = fetch_top(resource_id, demand_col, lat_col, lon_col, mun_col,
+                       min_kw=min_kw, top_n=top_n, chunk=int(chunk), max_chunks=int(max_chunks))
 
     if df.empty:
-        st.warning("Nenhum registro retornado. Teste min_kw=0 e confira o mapeamento de colunas.")
-    else:
-        if uf_filter:
-            df = df[df["UF"] == uf_filter]
+        st.warning("Nenhum registro retornado. Tente min_kw=0, aumente max_chunks ou revise mapeamento.")
+        st.stop()
 
-        st.write(f"**Fonte:** {fonte} | **min_kw:** {min_kw} | **TOP:** {top_n} | **Filtro UF:** {uf_filter or 'todas'}")
-        st.write(f"**Registros exibidos:** {len(df):,}")
+    if uf_filter:
+        df = df[df["UF"] == uf_filter].copy()
 
-        cols_show = ["UF","Potencial","Demanda_kW","GoogleMaps","Latitude","Longitude"]
-        for extra in ["CNAE","cnae","LGRD","lgrd","BRR","brr","CEP","cep","COD_ID_ENCR","cod_id_encr","MUN","mun"]:
-            if extra in df.columns and extra not in cols_show:
-                cols_show.append(extra)
-        cols_show = [c for c in cols_show if c in df.columns]
+    st.write(f"**Fonte:** {fonte} | **min_kw:** {min_kw} | **TOP:** {top_opt} | **UF:** {uf_filter or 'todas'}")
+    st.write(f"**Registros exibidos:** {len(df):,}")
 
-        st.dataframe(df[cols_show], use_container_width=True, height=520)
+    # Tabela comercial
+    preferred = [
+        "UF","Potencial","Demanda_kW","Endereco","BuscaGoogle","GoogleMaps","WhatsAppTexto",
+        "Latitude","Longitude","CNAE","CNAE_Limpo","Distribuidora","ID_UC"
+    ]
+    cols_show = [c for c in preferred if c in df.columns]
 
-        mapa = df[["Latitude","Longitude"]].rename(columns={"Latitude":"lat","Longitude":"lon"})
+    for extra in ["LGRD","BRR","CEP","DIST","MUN","COD_ID_ENCR"]:
+        if extra in df.columns and extra not in cols_show:
+            cols_show.append(extra)
+
+    st.dataframe(df[cols_show], use_container_width=True, height=520)
+
+    mapa = df[["Latitude","Longitude"]].dropna().rename(columns={"Latitude":"lat","Longitude":"lon"})
+    if not mapa.empty:
         st.map(mapa)
 
-        st.download_button(
-            "Baixar CSV (TOP)",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name=f"aneel_top_{top_n}.csv",
-            mime="text/csv"
-        )
+    # Export CRM
+    crm_cols = {
+        "UF": "UF",
+        "Potencial": "Potencial",
+        "Demanda_kW": "Demanda_kW",
+        "Endereco": "Endereco",
+        "BuscaGoogle": "BuscaGoogle",
+        "GoogleMaps": "GoogleMaps",
+        "WhatsAppTexto": "WhatsAppTexto",
+        "Distribuidora": "Distribuidora",
+        "CNAE_Limpo": "CNAE",
+        "ID_UC": "ID_UC",
+        "Latitude": "Latitude",
+        "Longitude": "Longitude"
+    }
+
+    export_df = df.copy()
+    export_df = export_df[[c for c in crm_cols.keys() if c in export_df.columns]].rename(columns=crm_cols)
+
+    st.download_button(
+        "Baixar CSV (CRM)",
+        data=export_df.to_csv(index=False).encode("utf-8"),
+        file_name="grupoA_export_crm.csv",
+        mime="text/csv"
+    )
 else:
-    st.info("Clique em **Gerar TOP agora** no sidebar para buscar dados e montar o TOP.")
-    st.caption("Dica: comece com TOP 100 e min_kw=0 para validar. Depois aumente para TOP 500.")
+    st.info("Ajuste parâmetros e clique em **Gerar TOP agora** no sidebar.")
