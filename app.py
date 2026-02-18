@@ -6,7 +6,7 @@ import requests
 
 st.set_page_config(page_title="Alexandria — Prospecção Grupo A (ANEEL)", layout="wide")
 st.title("Alexandria — Prospecção Grupo A (ANEEL)")
-st.caption("Versão comercial (sem Places): TOP maior, colunas ricas, export CRM e links de prospecção (Google Search + WhatsApp).")
+st.caption("Versão comercial (sem Places): TOP maior, filtros (Potencial/CNAE/Município), Score Alexandria e export CRM.")
 
 CKAN_SEARCH_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
 
@@ -20,7 +20,6 @@ UF_BY_IBGE_UF_CODE = {
     41:"PR",42:"SC",43:"RS",
     50:"MS",51:"MT",52:"GO",53:"DF"
 }
-UF_CODE_REV = {v:k for k,v in UF_BY_IBGE_UF_CODE.items()}
 
 # ---------------- CKAN (sem SQL) ----------------
 def ckan_search(resource_id: str, limit: int, offset: int) -> pd.DataFrame:
@@ -83,6 +82,53 @@ def make_google_search_link(query: str) -> str:
 def make_whatsapp_link(msg: str) -> str:
     return "https://wa.me/?text=" + urllib.parse.quote(msg)
 
+def potencia_label(dem_kw: float) -> str:
+    if dem_kw >= 5000: return "AAA"
+    if dem_kw >= 2000: return "AA"
+    if dem_kw >= 500:  return "A"
+    if dem_kw >= 100:  return "B"
+    return "C"
+
+def calc_score(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Score 0–100 (priorização):
+    - Demanda (principal): 0–70 pontos (log)
+    - Potencial: 0–20 pontos (AAA/AA/A/B/C)
+    - Urbanidade: 0–10 pontos (endereço mais completo tende a ser mais acionável)
+    """
+    out = df.copy()
+
+    # 1) Demanda -> 0..70 (log para não explodir)
+    d = out["Demanda_kW"].clip(lower=0.0)
+    import numpy as np
+    dem_score = np.log10(d + 1)  # 0..~6
+    # normaliza usando faixa típica 100..500000 (ajuste leve)
+    dem_norm = (dem_score - np.log10(100+1)) / (np.log10(500000+1) - np.log10(100+1))
+    dem_norm = dem_norm.clip(0, 1)
+    out["Score_Demanda"] = (dem_norm * 70).round(1)
+
+    # 2) Potencial -> 0..20
+    pot_map = {"AAA": 20, "AA": 16, "A": 12, "B": 6, "C": 2}
+    out["Score_Potencial"] = out["Potencial"].map(pot_map).fillna(0)
+
+    # 3) Urbanidade -> 0..10 (endereço com CEP/bairro/rua)
+    def urban_score(addr: str) -> int:
+        if not addr:
+            return 0
+        s = str(addr).upper()
+        pts = 0
+        if "CEP" in s: pts += 4
+        if "—" in s or "," in s: pts += 3
+        # se parece logradouro (tem número ou "RUA"/"AV"/"BR")
+        if any(x in s for x in ["RUA", "AV", "AL", "BR ", "ROD", "KM"]) or any(ch.isdigit() for ch in s):
+            pts += 3
+        return min(10, pts)
+
+    out["Score_Acionavel"] = out["Endereco"].apply(urban_score)
+
+    out["Score_Alexandria"] = (out["Score_Demanda"] + out["Score_Potencial"] + out["Score_Acionavel"]).round(1)
+    return out
+
 def enrich_base(df: pd.DataFrame, demand_col: str, lat_col: str, lon_col: str, mun_col: str | None) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -97,24 +143,18 @@ def enrich_base(df: pd.DataFrame, demand_col: str, lat_col: str, lon_col: str, m
         mun_num = pd.to_numeric(df[mun_col], errors="coerce")
         uf_code = (mun_num.fillna(0).astype("int64") // 100000).astype("int64")
         df["UF"] = uf_code.map(UF_BY_IBGE_UF_CODE).fillna("??")
+        df["IBGE_MUN"] = pd.to_numeric(df[mun_col], errors="coerce")
     else:
         df["UF"] = "??"
 
     # Potencial
-    def potencial(x):
-        if x >= 5000: return "AAA"
-        if x >= 2000: return "AA"
-        if x >= 500:  return "A"
-        if x >= 100:  return "B"
-        return "C"
-    df["Potencial"] = df["Demanda_kW"].apply(potencial)
+    df["Potencial"] = df["Demanda_kW"].apply(potencia_label)
 
-    # Detecta colunas de endereço (se existirem)
+    # endereço (se existir)
     LGRD = next((c for c in df.columns if c.upper() in ("LGRD","LOGRADOURO","ENDERECO")), None)
     BRR  = next((c for c in df.columns if c.upper() in ("BRR","BAIRRO")), None)
     CEP  = next((c for c in df.columns if c.upper() == "CEP"), None)
 
-    # CNAE, DIST, ID
     CNAE = next((c for c in df.columns if c.upper() == "CNAE"), None)
     DIST = next((c for c in df.columns if c.upper() in ("DIST","DISTRIBUIDORA","SIGLA_DIST")), None)
     IDUC = next((c for c in df.columns if c.upper() in ("COD_ID_ENCR","COD_ID_ENC","COD_ID_ENCRYP")), None)
@@ -125,19 +165,18 @@ def enrich_base(df: pd.DataFrame, demand_col: str, lat_col: str, lon_col: str, m
         if BRR and pd.notna(r.get(BRR)): parts.append(str(r.get(BRR)).strip())
         if CEP and pd.notna(r.get(CEP)): parts.append(f"CEP {str(r.get(CEP)).strip()}")
         parts.append(r.get("UF",""))
-        return ", ".join([p for p in parts if p])
+        return " — ".join([p for p in parts if p])
 
     df["Endereco"] = df.apply(addr_text, axis=1)
     df["GoogleMaps"] = df.apply(lambda r: f"https://www.google.com/maps?q={r['Latitude']},{r['Longitude']}", axis=1)
-
-    # Links de prospecção (Google Search)
     df["BuscaGoogle"] = df.apply(lambda r: make_google_search_link(r["Endereco"] if r["Endereco"] else f"{r['Latitude']},{r['Longitude']}"), axis=1)
 
-    # WhatsApp com texto (sem número — você cola o número que achar)
+    # WhatsApp texto (sem número)
     msg_base = ("Olá! Tudo bem? Aqui é o Fernando, da Alexandria Energia. "
                 "Estou falando com o responsável pela área administrativa/energia? "
-                "Estou fazendo um diagnóstico rápido para reduzir custos com energia em grandes consumidores.")
-    df["WhatsAppTexto"] = df.apply(lambda r: make_whatsapp_link(msg_base + f" (Ref: {r.get('UF','')})"), axis=1)
+                "Fiz um levantamento de grandes consumidores na sua região e posso te mostrar "
+                "um diagnóstico rápido para reduzir custos com energia.")
+    df["WhatsAppTexto"] = df.apply(lambda r: make_whatsapp_link(msg_base + f" (UF: {r.get('UF','')})"), axis=1)
 
     if CNAE:
         df["CNAE_Limpo"] = df[CNAE].astype(str).str.replace(r"[^0-9]", "", regex=True)
@@ -204,7 +243,7 @@ st.sidebar.subheader("Mapeamento de colunas")
 demand_col = st.sidebar.selectbox("Coluna de Demanda", cols, index=cols.index(auto_demand) if auto_demand in cols else 0)
 lat_col    = st.sidebar.selectbox("Coluna de Latitude", cols, index=cols.index(auto_lat) if auto_lat in cols else 0)
 lon_col    = st.sidebar.selectbox("Coluna de Longitude", cols, index=cols.index(auto_lon) if auto_lon in cols else 0)
-mun_col    = st.sidebar.selectbox("Coluna de Município (opcional)", ["(nenhuma)"] + cols,
+mun_col    = st.sidebar.selectbox("Coluna de Município (IBGE) (opcional)", ["(nenhuma)"] + cols,
                                  index=(["(nenhuma)"] + cols).index(auto_mun) if auto_mun in cols else 0)
 mun_col = None if mun_col == "(nenhuma)" else mun_col
 
@@ -217,6 +256,26 @@ top_opt = st.sidebar.selectbox(
 
 chunk = st.sidebar.selectbox("Tamanho do bloco (chunk)", [2000, 5000, 10000], index=1)
 max_chunks = st.sidebar.selectbox("Máx. blocos varridos", [4, 8, 12, 20], index=2)
+
+st.sidebar.subheader("Filtros comerciais")
+
+pot_sel = st.sidebar.multiselect(
+    "Potencial (selecionar)",
+    ["AAA","AA","A","B","C"],
+    default=["AAA","AA","A"]
+)
+
+cnae_prefix = st.sidebar.text_input("CNAE começa com (ex: 10, 47, 86) — opcional", "")
+
+mun_mode = st.sidebar.selectbox(
+    "Filtro Município (IBGE) — opcional",
+    ["(nenhum)", "Curitiba (4106902)", "Informar código IBGE"]
+)
+mun_custom = None
+if mun_mode == "Informar código IBGE":
+    mun_custom = st.sidebar.number_input("Código IBGE do município", min_value=0, value=0, step=1)
+
+sort_by = st.sidebar.selectbox("Ordenar por", ["Score Alexandria", "Demanda (kW)"], index=0)
 
 btn_run = st.sidebar.button("Gerar TOP agora", type="primary")
 
@@ -234,24 +293,49 @@ if btn_run:
         st.warning("Nenhum registro retornado. Tente min_kw=0, aumente max_chunks ou revise mapeamento.")
         st.stop()
 
+    # UF
     if uf_filter:
         df = df[df["UF"] == uf_filter].copy()
 
-    st.write(f"**Fonte:** {fonte} | **min_kw:** {min_kw} | **TOP:** {top_opt} | **UF:** {uf_filter or 'todas'}")
-    st.write(f"**Registros exibidos:** {len(df):,}")
+    # Potencial
+    if pot_sel:
+        df = df[df["Potencial"].isin(pot_sel)].copy()
 
-    # Tabela comercial
+    # Município (se tiver IBGE_MUN)
+    if mun_col and "IBGE_MUN" in df.columns:
+        if mun_mode == "Curitiba (4106902)":
+            df = df[df["IBGE_MUN"] == 4106902].copy()
+        elif mun_mode == "Informar código IBGE" and mun_custom and int(mun_custom) > 0:
+            df = df[df["IBGE_MUN"] == int(mun_custom)].copy()
+
+    # CNAE prefix
+    if cnae_prefix.strip():
+        if "CNAE_Limpo" in df.columns:
+            df = df[df["CNAE_Limpo"].astype(str).str.startswith(cnae_prefix.strip())].copy()
+        elif "CNAE" in df.columns:
+            df = df[df["CNAE"].astype(str).str.replace(r"[^0-9]","",regex=True).str.startswith(cnae_prefix.strip())].copy()
+
+    # Score
+    df = calc_score(df)
+
+    # Ordenação
+    if sort_by == "Score Alexandria":
+        df = df.sort_values("Score_Alexandria", ascending=False).copy()
+    else:
+        df = df.sort_values("Demanda_kW", ascending=False).copy()
+
+    st.write(f"**Fonte:** {fonte} | **min_kw:** {min_kw} | **TOP:** {top_opt} | **UF:** {uf_filter or 'todas'}")
+    st.write(f"**Registros exibidos (pós filtros):** {len(df):,}")
+
+    # Tabela comercial (com score)
     preferred = [
+        "Score_Alexandria","Score_Demanda","Score_Potencial","Score_Acionavel",
         "UF","Potencial","Demanda_kW","Endereco","BuscaGoogle","GoogleMaps","WhatsAppTexto",
-        "Latitude","Longitude","CNAE","CNAE_Limpo","Distribuidora","ID_UC"
+        "CNAE","CNAE_Limpo","Distribuidora","ID_UC","Latitude","Longitude"
     ]
     cols_show = [c for c in preferred if c in df.columns]
 
-    for extra in ["LGRD","BRR","CEP","DIST","MUN","COD_ID_ENCR"]:
-        if extra in df.columns and extra not in cols_show:
-            cols_show.append(extra)
-
-    st.dataframe(df[cols_show], use_container_width=True, height=520)
+    st.dataframe(df[cols_show], use_container_width=True, height=560)
 
     mapa = df[["Latitude","Longitude"]].dropna().rename(columns={"Latitude":"lat","Longitude":"lon"})
     if not mapa.empty:
@@ -259,6 +343,7 @@ if btn_run:
 
     # Export CRM
     crm_cols = {
+        "Score_Alexandria": "Score",
         "UF": "UF",
         "Potencial": "Potencial",
         "Demanda_kW": "Demanda_kW",
@@ -272,7 +357,6 @@ if btn_run:
         "Latitude": "Latitude",
         "Longitude": "Longitude"
     }
-
     export_df = df.copy()
     export_df = export_df[[c for c in crm_cols.keys() if c in export_df.columns]].rename(columns=crm_cols)
 
@@ -282,5 +366,7 @@ if btn_run:
         file_name="grupoA_export_crm.csv",
         mime="text/csv"
     )
+
 else:
     st.info("Ajuste parâmetros e clique em **Gerar TOP agora** no sidebar.")
+    st.caption("Dica: para TOP grandes, aumente max_chunks e use filtro UF/potencial para manter usável.")
