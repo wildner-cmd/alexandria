@@ -6,10 +6,14 @@ import requests
 
 st.set_page_config(page_title="Alexandria — Prospecção Grupo A (ANEEL)", layout="wide")
 st.title("Alexandria — Prospecção Grupo A (ANEEL)")
-st.caption("Versão comercial (sem Places): Lista Prioritária, Score Alexandria, filtros, export CRM e telefone FREE via OSM (quando existir).")
+st.caption(
+    "Versão comercial (sem Places): UF/Municípios (IBGE), lista prioritária, Score Alexandria, filtros, "
+    "export CRM e telefone FREE via OSM (quando existir)."
+)
 
 CKAN_SEARCH_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"  # OpenStreetMap Overpass (free, com limites)
+IBGE_API_BASE = "https://servicodados.ibge.gov.br/api/v1/localidades"
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"  # OSM Overpass (free, com limites)
 
 # ===== Resource IDs (Grupo A) =====
 RESOURCE_UCAT = "4318d38a-0bcd-421d-afb1-fb88b0c92a87"  # Alta tensão PJ
@@ -90,13 +94,22 @@ def potencia_label(dem_kw: float) -> str:
     if dem_kw >= 100:  return "B"
     return "C"
 
+# ---------------- IBGE Municípios por UF ----------------
+@st.cache_data(ttl=86400)
+def ibge_municipios_por_uf(uf: str) -> list[dict]:
+    """
+    Retorna lista de municípios do IBGE para uma UF (sigla, ex: 'PR').
+    Cada item: {"id": 4106902, "nome": "Curitiba"}
+    """
+    url = f"{IBGE_API_BASE}/estados/{uf}/municipios"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    data = sorted(data, key=lambda x: x.get("nome", ""))
+    return [{"id": int(x["id"]), "nome": x["nome"]} for x in data]
+
+# ---------------- Score Alexandria ----------------
 def calc_score(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Score 0–100 (priorização):
-    - Demanda: 0–70 (log)
-    - Potencial: 0–20
-    - Acionável/urbanidade (endereço): 0–10
-    """
     import numpy as np
     out = df.copy()
 
@@ -126,17 +139,18 @@ def calc_score(df: pd.DataFrame) -> pd.DataFrame:
 
     out["Score_Acionavel"] = out.get("Endereco", "").apply(urban_score)
 
-    # força numérico
     out["Score_Demanda"] = pd.to_numeric(out["Score_Demanda"], errors="coerce").fillna(0.0)
     out["Score_Potencial"] = pd.to_numeric(out["Score_Potencial"], errors="coerce").fillna(0.0)
     out["Score_Acionavel"] = pd.to_numeric(out["Score_Acionavel"], errors="coerce").fillna(0.0)
 
     out["Score_Alexandria"] = (out["Score_Demanda"] + out["Score_Potencial"] + out["Score_Acionavel"]).round(1)
+
     out["Score_Demanda"] = out["Score_Demanda"].round(1)
     out["Score_Potencial"] = out["Score_Potencial"].round(1)
     out["Score_Acionavel"] = out["Score_Acionavel"].round(1)
     return out
 
+# ---------------- Enriquecimento base ----------------
 def enrich_base(df: pd.DataFrame, demand_col: str, lat_col: str, lon_col: str, mun_col: str | None) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -156,7 +170,6 @@ def enrich_base(df: pd.DataFrame, demand_col: str, lat_col: str, lon_col: str, m
 
     df["Potencial"] = df["Demanda_kW"].apply(potencia_label)
 
-    # colunas úteis (se existirem)
     LGRD = next((c for c in df.columns if c.upper() in ("LGRD", "LOGRADOURO", "ENDERECO")), None)
     BRR  = next((c for c in df.columns if c.upper() in ("BRR", "BAIRRO")), None)
     CEP  = next((c for c in df.columns if c.upper() == "CEP"), None)
@@ -174,13 +187,11 @@ def enrich_base(df: pd.DataFrame, demand_col: str, lat_col: str, lon_col: str, m
 
     df["Endereco"] = df.apply(addr_text, axis=1)
     df["GoogleMaps"] = df.apply(lambda r: f"https://www.google.com/maps?q={r['Latitude']},{r['Longitude']}", axis=1)
-
     df["BuscaGoogle"] = df.apply(
         lambda r: make_google_search_link(r["Endereco"] if r["Endereco"] else f"{r['Latitude']},{r['Longitude']}"),
         axis=1
     )
 
-    # texto padrão de WhatsApp (sem número)
     msg_base = (
         "Olá! Tudo bem? Aqui é o Fernando, da Alexandria Energia. "
         "Estou falando com o responsável pela área administrativa/energia? "
@@ -225,11 +236,6 @@ def fetch_top(resource_id: str, demand_col: str, lat_col: str, lon_col: str, mun
 # ---------------- Telefone FREE via OpenStreetMap (Overpass) ----------------
 @st.cache_data(ttl=86400)
 def osm_lookup_phone(lat: float, lon: float, radius_m: int = 250) -> dict:
-    """
-    Tenta encontrar POI próximo no OSM com phone/contact:phone.
-    Retorna dict com nome, telefone, site (quando existir).
-    """
-    # Query procura nodes/ways/relations com phone em um raio
     query = f"""
     [out:json][timeout:25];
     (
@@ -250,8 +256,6 @@ def osm_lookup_phone(lat: float, lon: float, radius_m: int = 250) -> dict:
         elements = data.get("elements", [])
         if not elements:
             return {}
-
-        # escolhe o primeiro com telefone e (idealmente) nome
         for el in elements:
             tags = el.get("tags", {}) or {}
             phone = tags.get("phone") or tags.get("contact:phone") or ""
@@ -259,7 +263,6 @@ def osm_lookup_phone(lat: float, lon: float, radius_m: int = 250) -> dict:
             website = tags.get("website") or tags.get("contact:website") or ""
             if phone:
                 return {"OSM_Nome": name, "OSM_Telefone": phone, "OSM_Website": website}
-
         return {}
     except Exception:
         return {}
@@ -279,23 +282,21 @@ def enrich_osm_batch(df: pd.DataFrame, radius_m: int, max_rows: int) -> pd.DataF
             out.at[out.index[i], "OSM_Nome"] = res.get("OSM_Nome", "")
             out.at[out.index[i], "OSM_Telefone"] = res.get("OSM_Telefone", "")
             out.at[out.index[i], "OSM_Website"] = res.get("OSM_Website", "")
-        # pequena pausa ajuda a não irritar o endpoint
         time.sleep(0.05)
-
     return out
 
-# ================= UI =================
+# ================= UI / Session defaults =================
 if "preset_applied" not in st.session_state:
     st.session_state.preset_applied = False
 
 st.sidebar.header("Atalhos comerciais")
 
-# Preset forte: PR, AAA/AA/A, TOP 200, ordenado por score, min_kw 500
 if st.sidebar.button("Lista Alexandria — PR — Prioridade Máxima", type="primary"):
     st.session_state.preset_applied = True
     st.session_state.preset_uf = "PR"
+    st.session_state.preset_mun_id = None
     st.session_state.preset_pot = ["AAA", "AA", "A"]
-    st.session_state.preset_top = "2000"  # buscamos maior e filtramos depois por score/top final
+    st.session_state.preset_top = "2000"
     st.session_state.preset_min_kw = 500.0
     st.session_state.preset_sort = "Score Alexandria"
 
@@ -304,15 +305,41 @@ st.sidebar.header("Parâmetros")
 fonte = st.sidebar.selectbox("Fonte", ["UCMT (Média tensão PJ)", "UCAT (Alta tensão PJ)"])
 resource_id = RESOURCE_UCMT if fonte.startswith("UCMT") else RESOURCE_UCAT
 
-# defaults (com preset)
 min_kw_default = st.session_state.get("preset_min_kw", 1000.0) if st.session_state.preset_applied else 1000.0
 min_kw = st.sidebar.number_input("Demanda mínima (kW)", min_value=0.0, value=float(min_kw_default), step=100.0)
 
-ufs = ["(todas)"] + list(UF_BY_IBGE_UF_CODE.values())
-uf_default = st.session_state.get("preset_uf", "PR") if st.session_state.preset_applied else "PR"
-uf_sel = st.sidebar.selectbox("Filtro UF (opcional)", ufs, index=ufs.index(uf_default) if uf_default in ufs else 0)
-uf_filter = None if uf_sel == "(todas)" else uf_sel
+# ----- UF e Município (TODOS + IBGE) -----
+st.sidebar.subheader("Região (UF / Município)")
 
+ufs = ["TODOS"] + sorted(list(UF_BY_IBGE_UF_CODE.values()))
+uf_default = st.session_state.get("preset_uf", "TODOS") if st.session_state.preset_applied else "TODOS"
+uf_sel = st.sidebar.selectbox("UF", ufs, index=ufs.index(uf_default) if uf_default in ufs else 0)
+
+mun_sel_id = None
+mun_label = "TODOS"
+
+if uf_sel == "TODOS":
+    st.sidebar.selectbox("Município", ["TODOS"], index=0, disabled=True)
+else:
+    municipios = ibge_municipios_por_uf(uf_sel)
+    mun_options = ["TODOS"] + [f'{m["nome"]} ({m["id"]})' for m in municipios]
+
+    preset_mun_id = st.session_state.get("preset_mun_id", None) if st.session_state.preset_applied else None
+    default_mun_idx = 0
+    if preset_mun_id is not None:
+        # tenta localizar preset na lista
+        key = f"({int(preset_mun_id)})"
+        for i, opt in enumerate(mun_options):
+            if opt.endswith(key):
+                default_mun_idx = i
+                break
+
+    mun_pick = st.sidebar.selectbox("Município", mun_options, index=default_mun_idx)
+    if mun_pick != "TODOS":
+        mun_sel_id = int(mun_pick.split("(")[-1].replace(")", "").strip())
+        mun_label = mun_pick
+
+# ----- Mapeamento -----
 cols = probe_columns(resource_id)
 if not cols:
     st.error("Não consegui ler colunas do dataset. Tente 'Manage app → Reboot'.")
@@ -336,33 +363,26 @@ mun_col    = st.sidebar.selectbox("Coluna de Município (IBGE) (opcional)", ["(n
                                  index=(["(nenhuma)"] + cols).index(auto_mun) if auto_mun in cols else 0)
 mun_col = None if mun_col == "(nenhuma)" else mun_col
 
+# ----- TOP -----
 st.sidebar.subheader("TOP (atalhos)")
 top_default = st.session_state.get("preset_top", "500") if st.session_state.preset_applied else "500"
-top_opt = st.sidebar.selectbox(
-    "Tamanho do TOP",
-    ["100", "200", "500", "1000", "2000", "5000", "10000", "MAX (seguro)"],
-    index=(["100","200","500","1000","2000","5000","10000","MAX (seguro)"].index(top_default)
-           if top_default in ["100","200","500","1000","2000","5000","10000","MAX (seguro)"] else 2)
-)
+top_choices = ["100", "200", "500", "1000", "2000", "5000", "10000", "MAX (seguro)"]
+top_opt = st.sidebar.selectbox("Tamanho do TOP", top_choices, index=top_choices.index(top_default) if top_default in top_choices else 2)
 
 chunk = st.sidebar.selectbox("Tamanho do bloco (chunk)", [2000, 5000, 10000], index=1)
 max_chunks = st.sidebar.selectbox("Máx. blocos varridos", [4, 8, 12, 20], index=2)
 
+# ----- Filtros comerciais -----
 st.sidebar.subheader("Filtros comerciais")
-pot_default = st.session_state.get("preset_pot", ["AAA", "AA", "A"]) if st.session_state.preset_applied else ["AAA","AA","A"]
+pot_default = st.session_state.get("preset_pot", ["AAA", "AA", "A"]) if st.session_state.preset_applied else ["AAA", "AA", "A"]
 pot_sel = st.sidebar.multiselect("Potencial (selecionar)", ["AAA", "AA", "A", "B", "C"], default=pot_default)
 
 cnae_prefix = st.sidebar.text_input("CNAE começa com (ex: 10, 47, 86) — opcional", "")
 
-mun_mode = st.sidebar.selectbox("Filtro Município (IBGE) — opcional", ["(nenhum)", "Curitiba (4106902)", "Informar código IBGE"])
-mun_custom = None
-if mun_mode == "Informar código IBGE":
-    mun_custom = st.sidebar.number_input("Código IBGE do município", min_value=0, value=0, step=1)
-
 sort_default = st.session_state.get("preset_sort", "Score Alexandria") if st.session_state.preset_applied else "Score Alexandria"
-sort_by = st.sidebar.selectbox("Ordenar por", ["Score Alexandria", "Demanda (kW)"],
-                               index=0 if sort_default == "Score Alexandria" else 1)
+sort_by = st.sidebar.selectbox("Ordenar por", ["Score Alexandria", "Demanda (kW)"], index=0 if sort_default == "Score Alexandria" else 1)
 
+# ----- Telefone FREE -----
 st.sidebar.subheader("Telefone (FREE) via OpenStreetMap")
 enable_osm = st.sidebar.checkbox("Enriquecer com OSM (nome/telefone quando houver)", value=False)
 osm_radius = st.sidebar.selectbox("Raio (metros)", [100, 250, 500, 1000], index=1)
@@ -377,26 +397,34 @@ if btn_run:
         top_n = int(top_opt)
 
     with st.spinner("Buscando dados e montando TOP..."):
-        df = fetch_top(resource_id, demand_col, lat_col, lon_col, mun_col,
-                       min_kw=min_kw, top_n=top_n, chunk=int(chunk), max_chunks=int(max_chunks))
+        df = fetch_top(
+            resource_id,
+            demand_col, lat_col, lon_col, mun_col,
+            min_kw=min_kw,
+            top_n=top_n,
+            chunk=int(chunk),
+            max_chunks=int(max_chunks),
+        )
 
     if df.empty:
         st.warning("Nenhum registro retornado. Tente min_kw=0, aumente max_chunks ou revise mapeamento.")
         st.stop()
 
-    # filtros
-    if uf_filter:
-        df = df[df["UF"] == uf_filter].copy()
+    # UF/Município (TODOS)
+    if uf_sel != "TODOS":
+        df = df[df["UF"] == uf_sel].copy()
 
+    if mun_sel_id is not None:
+        if "IBGE_MUN" in df.columns:
+            df = df[df["IBGE_MUN"] == mun_sel_id].copy()
+        else:
+            st.warning("Dataset não possui IBGE_MUN; filtro por município indisponível.")
+
+    # Potencial
     if pot_sel:
         df = df[df["Potencial"].isin(pot_sel)].copy()
 
-    if mun_col and "IBGE_MUN" in df.columns:
-        if mun_mode == "Curitiba (4106902)":
-            df = df[df["IBGE_MUN"] == 4106902].copy()
-        elif mun_mode == "Informar código IBGE" and mun_custom and int(mun_custom) > 0:
-            df = df[df["IBGE_MUN"] == int(mun_custom)].copy()
-
+    # CNAE prefix
     if cnae_prefix.strip():
         prefix = cnae_prefix.strip()
         if "CNAE_Limpo" in df.columns:
@@ -405,10 +433,10 @@ if btn_run:
             tmp = df["CNAE"].astype(str).str.replace(r"[^0-9]", "", regex=True)
             df = df[tmp.str.startswith(prefix)].copy()
 
-    # score
+    # Score
     df = calc_score(df)
 
-    # ordenação
+    # Ordenação
     if sort_by == "Score Alexandria":
         df = df.sort_values("Score_Alexandria", ascending=False).copy()
     else:
@@ -419,22 +447,21 @@ if btn_run:
         with st.spinner("Enriquecendo via OpenStreetMap (quando houver telefone)..."):
             df = enrich_osm_batch(df, radius_m=int(osm_radius), max_rows=int(osm_rows))
 
-    st.write(f"**Fonte:** {fonte} | **min_kw:** {min_kw} | **TOP:** {top_opt} | **UF:** {uf_filter or 'todas'}")
+    st.write(f"**Fonte:** {fonte} | **min_kw:** {min_kw} | **TOP:** {top_opt} | **UF:** {uf_sel} | **Município:** {mun_label}")
     st.write(f"**Registros exibidos (pós filtros):** {len(df):,}")
 
-    # Tabela comercial
     preferred = [
-        "Score_Alexandria","Score_Demanda","Score_Potencial","Score_Acionavel",
-        "UF","Potencial","Demanda_kW",
-        "OSM_Nome","OSM_Telefone","OSM_Website",
-        "Endereco","BuscaGoogle","GoogleMaps","WhatsAppTexto",
-        "CNAE","CNAE_Limpo","Distribuidora","ID_UC",
-        "Latitude","Longitude"
+        "Score_Alexandria", "Score_Demanda", "Score_Potencial", "Score_Acionavel",
+        "UF", "IBGE_MUN", "Potencial", "Demanda_kW",
+        "OSM_Nome", "OSM_Telefone", "OSM_Website",
+        "Endereco", "BuscaGoogle", "GoogleMaps", "WhatsAppTexto",
+        "CNAE", "CNAE_Limpo", "Distribuidora", "ID_UC",
+        "Latitude", "Longitude"
     ]
     cols_show = [c for c in preferred if c in df.columns]
     st.dataframe(df[cols_show], use_container_width=True, height=560)
 
-    mapa = df[["Latitude","Longitude"]].dropna().rename(columns={"Latitude":"lat","Longitude":"lon"})
+    mapa = df[["Latitude", "Longitude"]].dropna().rename(columns={"Latitude": "lat", "Longitude": "lon"})
     if not mapa.empty:
         st.map(mapa)
 
@@ -442,6 +469,7 @@ if btn_run:
     crm_cols = {
         "Score_Alexandria": "Score",
         "UF": "UF",
+        "IBGE_MUN": "IBGE_MUN",
         "Potencial": "Potencial",
         "Demanda_kW": "Demanda_kW",
         "OSM_Nome": "Nome",
@@ -467,9 +495,11 @@ if btn_run:
         mime="text/csv"
     )
 
-    # dica operacional
-    st.caption("Telefone FREE via OSM: funciona quando existe cadastro no OpenStreetMap. Para casos sem telefone, use o link 'BuscaGoogle' e o script de WhatsApp.")
+    st.caption(
+        "Telefone FREE via OSM: aparece quando existe cadastro no OpenStreetMap. "
+        "Quando não houver, use o link 'BuscaGoogle' para encontrar telefone/site rapidamente."
+    )
 
 else:
     st.info("Ajuste parâmetros e clique em **Gerar TOP agora** no sidebar.")
-    st.caption("Dica: use o botão 'Lista Alexandria — PR — Prioridade Máxima' para gerar uma lista pronta de prospecção.")
+    st.caption("Dica: use 'Lista Alexandria — PR — Prioridade Máxima' para gerar uma lista pronta de prospecção.")
